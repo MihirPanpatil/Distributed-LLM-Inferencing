@@ -1,0 +1,276 @@
+{% extends 'dashboard/base.html' %}
+
+{% block title %}Node Management - Distributed LLM Inferencing{% endblock %}
+
+{% block header %}Worker Node Management{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Add Node Form -->
+    <div class="col-md-4 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-plus-circle me-2"></i>Add Worker Node
+            </div>
+            <div class="card-body">
+                <form id="add-node-form">
+                    {% csrf_token %}
+                    <div class="mb-3">
+                        <label for="id_hostname" class="form-label">Hostname</label>
+                        {{ form.hostname }}
+                    </div>
+                    <div class="mb-3">
+                        <label for="id_ip_address" class="form-label">IP Address</label>
+                        {{ form.ip_address }}
+                    </div>
+                    <div class="mb-3">
+                        <label for="id_port" class="form-label">Port</label>
+                        {{ form.port }}
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Node</button>
+                </form>
+                <div id="add-node-result" class="mt-3"></div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Node Status -->
+    <div class="col-md-8 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-hdd-network me-2"></i>Worker Nodes
+                <button id="refresh-nodes" class="btn btn-sm btn-outline-secondary float-end">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>Hostname</th>
+                                <th>Address</th>
+                                <th>Status</th>
+                                <th>CPU</th>
+                                <th>Memory</th>
+                                <th>GPU</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="nodes-table-body">
+                            {% for node in nodes %}
+                            <tr>
+                                <td>{{ node.hostname }}</td>
+                                <td>{{ node.ip_address }}:{{ node.port }}</td>
+                                <td>
+                                    {% if node.is_active %}
+                                        <span class="badge bg-success">Active</span>
+                                    {% else %}
+                                        <span class="badge bg-danger">Inactive</span>
+                                    {% endif %}
+                                </td>
+                                <td>-</td>
+                                <td>-</td>
+                                <td>-</td>
+                                <td>
+                                    <button class="btn btn-sm btn-danger remove-node" data-node-id="{{ node.id }}">
+                                        <i class="bi bi-trash"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                            {% empty %}
+                            <tr>
+                                <td colspan="7" class="text-center">No worker nodes added yet</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Model Shards Section -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-layers me-2"></i>Model Shards
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                <th>Shard ID</th>
+                                <th>Node</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody id="shards-table-body">
+                            <!-- Will be populated via JavaScript -->
+                            <tr>
+                                <td colspan="4" class="text-center">No model shards loaded</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    $(document).ready(function() {
+        // Function to refresh node status
+        function refreshNodes() {
+            $.ajax({
+                url: "{% url 'node_status' %}",
+                success: function(data) {
+                    // Clear the table
+                    $("#nodes-table-body").empty();
+                    
+                    // Clear the shards table
+                    $("#shards-table-body").empty();
+                    
+                    if (data.nodes.length === 0) {
+                        $("#nodes-table-body").html('<tr><td colspan="7" class="text-center">No worker nodes added yet</td></tr>');
+                        $("#shards-table-body").html('<tr><td colspan="4" class="text-center">No model shards loaded</td></tr>');
+                        return;
+                    }
+                    
+                    // Add each node to the table
+                    let shards = [];
+                    
+                    data.nodes.forEach(function(node) {
+                        let statusBadge = node.is_active 
+                            ? '<span class="badge bg-success">Active</span>' 
+                            : '<span class="badge bg-danger">Inactive</span>';
+                        
+                        let cpuUsage = '-';
+                        let memoryUsage = '-';
+                        let gpuUsage = '-';
+                        
+                        if (node.resources) {
+                            cpuUsage = Math.round(node.resources.cpu * 100) + '%';
+                            memoryUsage = Math.round(node.resources.memory * 100) + '%';
+                            gpuUsage = Math.round(node.resources.gpu * 100) + '%';
+                        }
+                        
+                        let row = `
+                            <tr>
+                                <td>${node.hostname}</td>
+                                <td>${node.ip_address}:${node.port}</td>
+                                <td>${statusBadge}</td>
+                                <td>${cpuUsage}</td>
+                                <td>${memoryUsage}</td>
+                                <td>${gpuUsage}</td>
+                                <td>
+                                    <button class="btn btn-sm btn-danger remove-node" data-node-id="${node.id}">
+                                        <i class="bi bi-trash"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                        `;
+                        
+                        $("#nodes-table-body").append(row);
+                        
+                        // Collect shards information
+                        if (node.loaded_shards && node.loaded_shards.length > 0) {
+                            node.loaded_shards.forEach(function(shard) {
+                                shards.push({
+                                    model_name: shard.model_name,
+                                    shard_id: shard.shard_id,
+                                    node_hostname: node.hostname,
+                                    is_active: node.is_active
+                                });
+                            });
+                        }
+                    });
+                    
+                    // Add shards to the table
+                    if (shards.length > 0) {
+                        shards.forEach(function(shard) {
+                            let statusBadge = shard.is_active 
+                                ? '<span class="badge bg-success">Active</span>' 
+                                : '<span class="badge bg-danger">Inactive</span>';
+                            
+                            let row = `
+                                <tr>
+                                    <td>${shard.model_name}</td>
+                                    <td>${shard.shard_id}</td>
+                                    <td>${shard.node_hostname}</td>
+                                    <td>${statusBadge}</td>
+                                </tr>
+                            `;
+                            
+                            $("#shards-table-body").append(row);
+                        });
+                    } else {
+                        $("#shards-table-body").html('<tr><td colspan="4" class="text-center">No model shards loaded</td></tr>');
+                    }
+                }
+            });
+        }
+        
+        // Initial refresh
+        refreshNodes();
+        
+        // Refresh when button is clicked
+        $("#refresh-nodes").click(function() {
+            refreshNodes();
+        });
+        
+        // Auto-refresh every 10 seconds
+        setInterval(refreshNodes, 10000);
+        
+        // Add node form submission
+        $("#add-node-form").submit(function(e) {
+            e.preventDefault();
+            
+            $.ajax({
+                url: "{% url 'add_node' %}",
+                method: "POST",
+                data: $(this).serialize(),
+                beforeSend: function() {
+                    $("#add-node-result").html('<div class="alert alert-info">Adding node...</div>');
+                },
+                success: function(data) {
+                    $("#add-node-result").html('<div class="alert alert-success">Node added successfully!</div>');
+                    $("#add-node-form")[0].reset();
+                    refreshNodes();
+                },
+                error: function(xhr) {
+                    let errorMsg = "Failed to add node";
+                    if (xhr.responseJSON && xhr.responseJSON.message) {
+                        errorMsg = xhr.responseJSON.message;
+                    }
+                    $("#add-node-result").html(`<div class="alert alert-danger">${errorMsg}</div>`);
+                }
+            });
+        });
+        
+        // Remove node button click
+        $(document).on("click", ".remove-node", function() {
+            let nodeId = $(this).data("node-id");
+            
+            if (confirm("Are you sure you want to remove this node?")) {
+                $.ajax({
+                    url: `/api/nodes/remove/${nodeId}/`,
+                    method: "POST",
+                    success: function() {
+                        refreshNodes();
+                    },
+                    error: function() {
+                        alert("Failed to remove node");
+                    }
+                });
+            }
+        });
+    });
+</script>
+{% endblock %}

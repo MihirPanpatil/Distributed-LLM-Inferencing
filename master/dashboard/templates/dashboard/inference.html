@@ -1,0 +1,318 @@
+{% extends 'dashboard/base.html' %}
+
+{% block title %}Inference - Distributed LLM Inferencing{% endblock %}
+
+{% block header %}Run Inference{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- Inference Form -->
+    <div class="col-md-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-cpu me-2"></i>Submit Inference Request
+            </div>
+            <div class="card-body">
+                <form id="inference-form">
+                    {% csrf_token %}
+                    <div class="mb-3">
+                        <label for="id_model_name" class="form-label">Model Name</label>
+                        {{ form.model_name }}
+                        <small class="form-text text-muted">
+                            Enter a Hugging Face model name (e.g., "gpt2", "facebook/opt-350m")
+                        </small>
+                    </div>
+                    <div class="mb-3">
+                        <label for="id_prompt" class="form-label">Prompt</label>
+                        {{ form.prompt }}
+                    </div>
+                    <button type="submit" class="btn btn-primary">Submit</button>
+                </form>
+                <div id="inference-result" class="mt-3"></div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Inference Result -->
+    <div class="col-md-6 mb-4">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-file-text me-2"></i>Inference Result
+            </div>
+            <div class="card-body">
+                <div id="result-container">
+                    <div class="alert alert-info">
+                        Submit an inference request to see results here.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Inference Requests -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-clock-history me-2"></i>Recent Inference Requests
+                <button id="refresh-inferences" class="btn btn-sm btn-outline-secondary float-end">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Model</th>
+                                <th>Status</th>
+                                <th>Created</th>
+                                <th>Completed</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="inferences-table-body">
+                            {% for request in recent_requests %}
+                            <tr>
+                                <td>{{ request.id }}</td>
+                                <td>{{ request.model_name }}</td>
+                                <td>
+                                    {% if request.status == 'completed' %}
+                                        <span class="badge bg-success">Completed</span>
+                                    {% elif request.status == 'processing' %}
+                                        <span class="badge bg-warning">Processing</span>
+                                    {% elif request.status == 'pending' %}
+                                        <span class="badge bg-info">Pending</span>
+                                    {% else %}
+                                        <span class="badge bg-danger">Failed</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ request.created_at|date:"Y-m-d H:i:s" }}</td>
+                                <td>{{ request.completed_at|date:"Y-m-d H:i:s"|default:"-" }}</td>
+                                <td>
+                                    <button class="btn btn-sm btn-primary view-result" data-request-id="{{ request.id }}">
+                                        <i class="bi bi-eye"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                            {% empty %}
+                            <tr>
+                                <td colspan="6" class="text-center">No inference requests yet</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    $(document).ready(function() {
+        // Function to refresh inference requests
+        function refreshInferences() {
+            $.ajax({
+                url: "{% url 'recent_inferences' %}",
+                success: function(data) {
+                    // Clear the table
+                    $("#inferences-table-body").empty();
+                    
+                    if (data.requests.length === 0) {
+                        $("#inferences-table-body").html('<tr><td colspan="6" class="text-center">No inference requests yet</td></tr>');
+                        return;
+                    }
+                    
+                    // Add each request to the table
+                    data.requests.forEach(function(request) {
+                        let statusBadge = '';
+                        if (request.status === 'completed') {
+                            statusBadge = '<span class="badge bg-success">Completed</span>';
+                        } else if (request.status === 'processing') {
+                            statusBadge = '<span class="badge bg-warning">Processing</span>';
+                        } else if (request.status === 'pending') {
+                            statusBadge = '<span class="badge bg-info">Pending</span>';
+                        } else {
+                            statusBadge = '<span class="badge bg-danger">Failed</span>';
+                        }
+                        
+                        let completedAt = request.completed_at ? new Date(request.completed_at).toLocaleString() : '-';
+                        
+                        let row = `
+                            <tr>
+                                <td>${request.id}</td>
+                                <td>${request.model_name}</td>
+                                <td>${statusBadge}</td>
+                                <td>${new Date(request.created_at).toLocaleString()}</td>
+                                <td>${completedAt}</td>
+                                <td>
+                                    <button class="btn btn-sm btn-primary view-result" data-request-id="${request.id}">
+                                        <i class="bi bi-eye"></i>
+                                    </button>
+                                </td>
+                            </tr>
+                        `;
+                        
+                        $("#inferences-table-body").append(row);
+                    });
+                }
+            });
+        }
+        
+        // Initial refresh
+        refreshInferences();
+        
+        // Refresh when button is clicked
+        $("#refresh-inferences").click(function() {
+            refreshInferences();
+        });
+        
+        // Auto-refresh every 10 seconds
+        setInterval(refreshInferences, 10000);
+        
+        // Inference form submission
+        $("#inference-form").submit(function(e) {
+            e.preventDefault();
+            
+            $.ajax({
+                url: "{% url 'submit_inference' %}",
+                method: "POST",
+                data: $(this).serialize(),
+                beforeSend: function() {
+                    $("#inference-result").html('<div class="alert alert-info">Submitting inference request...</div>');
+                    $("#result-container").html('<div class="alert alert-info">Processing...</div>');
+                },
+                success: function(data) {
+                    $("#inference-result").html('<div class="alert alert-success">Request submitted successfully!</div>');
+                    
+                    // Poll for results
+                    pollInferenceStatus(data.request_id);
+                },
+                error: function(xhr) {
+                    let errorMsg = "Failed to submit inference request";
+                    if (xhr.responseJSON && xhr.responseJSON.message) {
+                        errorMsg = xhr.responseJSON.message;
+                    }
+                    $("#inference-result").html(`<div class="alert alert-danger">${errorMsg}</div>`);
+                }
+            });
+        });
+        
+        // Function to poll inference status
+        function pollInferenceStatus(requestId) {
+            let pollInterval = setInterval(function() {
+                $.ajax({
+                    url: `/api/inference/status/${requestId}/`,
+                    success: function(data) {
+                        if (data.status === 'completed') {
+                            clearInterval(pollInterval);
+                            $("#result-container").html(`
+                                <div class="mb-3">
+                                    <h5>Prompt:</h5>
+                                    <p>${data.prompt}</p>
+                                </div>
+                                <div>
+                                    <h5>Generated Text:</h5>
+                                    <p>${data.result}</p>
+                                </div>
+                            `);
+                            refreshInferences();
+                        } else if (data.status === 'failed') {
+                            clearInterval(pollInterval);
+                            $("#result-container").html(`
+                                <div class="alert alert-danger">
+                                    <h5>Error:</h5>
+                                    <p>${data.error}</p>
+                                </div>
+                            `);
+                            refreshInferences();
+                        } else {
+                            // Still processing or pending
+                            $("#result-container").html(`
+                                <div class="alert alert-info">
+                                    <h5>Status: ${data.status}</h5>
+                                    <p>Please wait while the inference is being processed...</p>
+                                    <div class="progress mt-3">
+                                        <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                                             role="progressbar" style="width: 100%"></div>
+                                    </div>
+                                </div>
+                            `);
+                        }
+                    },
+                    error: function() {
+                        clearInterval(pollInterval);
+                        $("#result-container").html(`
+                            <div class="alert alert-danger">
+                                <h5>Error:</h5>
+                                <p>Failed to retrieve inference status</p>
+                            </div>
+                        `);
+                    }
+                });
+            }, 2000);  // Poll every 2 seconds
+        }
+        
+        // View result button click
+        $(document).on("click", ".view-result", function() {
+            let requestId = $(this).data("request-id");
+            
+            $.ajax({
+                url: `/api/inference/status/${requestId}/`,
+                beforeSend: function() {
+                    $("#result-container").html('<div class="alert alert-info">Loading result...</div>');
+                },
+                success: function(data) {
+                    if (data.status === 'completed') {
+                        $("#result-container").html(`
+                            <div class="mb-3">
+                                <h5>Prompt:</h5>
+                                <p>${data.prompt}</p>
+                            </div>
+                            <div>
+                                <h5>Generated Text:</h5>
+                                <p>${data.result}</p>
+                            </div>
+                        `);
+                    } else if (data.status === 'failed') {
+                        $("#result-container").html(`
+                            <div class="alert alert-danger">
+                                <h5>Error:</h5>
+                                <p>${data.error}</p>
+                            </div>
+                        `);
+                    } else {
+                        // Still processing or pending
+                        $("#result-container").html(`
+                            <div class="alert alert-info">
+                                <h5>Status: ${data.status}</h5>
+                                <p>Please wait while the inference is being processed...</p>
+                                <div class="progress mt-3">
+                                    <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                                         role="progressbar" style="width: 100%"></div>
+                                </div>
+                            </div>
+                        `);
+                        
+                        // Start polling
+                        pollInferenceStatus(requestId);
+                    }
+                },
+                error: function() {
+                    $("#result-container").html(`
+                        <div class="alert alert-danger">
+                            <h5>Error:</h5>
+                            <p>Failed to retrieve inference result</p>
+                        </div>
+                    `);
+                }
+            });
+        });
+    });
+</script>
+{% endblock %}
+

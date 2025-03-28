@@ -1,0 +1,136 @@
+{% extends 'dashboard/base.html' %}
+
+{% block title %}Dashboard - Distributed LLM Inferencing{% endblock %}
+
+{% block header %}System Dashboard{% endblock %}
+
+{% block content %}
+<div class="row">
+    <!-- System Stats -->
+    <div class="col-md-6 col-lg-3 mb-4">
+        <div class="card border-primary h-100">
+            <div class="card-header bg-primary text-white">
+                <i class="bi bi-hdd-network me-2"></i>Worker Nodes
+            </div>
+            <div class="card-body">
+                <h5 class="card-title">{{ active_nodes }} / {{ total_nodes }}</h5>
+                <p class="card-text">Active worker nodes</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6 col-lg-3 mb-4">
+        <div class="card border-info h-100">
+            <div class="card-header bg-info text-white">
+                <i class="bi bi-hourglass-split me-2"></i>Pending Requests
+            </div>
+            <div class="card-body">
+                <h5 class="card-title">{{ pending_requests }}</h5>
+                <p class="card-text">Waiting to be processed</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6 col-lg-3 mb-4">
+        <div class="card border-warning h-100">
+            <div class="card-header bg-warning text-white">
+                <i class="bi bi-cpu me-2"></i>Processing
+            </div>
+            <div class="card-body">
+                <h5 class="card-title">{{ processing_requests }}</h5>
+                <p class="card-text">Currently being processed</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="col-md-6 col-lg-3 mb-4">
+        <div class="card border-success h-100">
+            <div class="card-header bg-success text-white">
+                <i class="bi bi-check-circle me-2"></i>System Status
+            </div>
+            <div class="card-body">
+                <h5 class="card-title" id="system-status">
+                    {% if active_nodes > 0 %}
+                        <span class="text-success">Operational</span>
+                    {% else %}
+                        <span class="text-danger">No Active Nodes</span>
+                    {% endif %}
+                </h5>
+                <p class="card-text">Overall system health</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Inference Requests -->
+<div class="row mt-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <i class="bi bi-clock-history me-2"></i>Recent Inference Requests
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Model</th>
+                                <th>Status</th>
+                                <th>Created</th>
+                                <th>Completed</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for request in recent_requests %}
+                            <tr>
+                                <td>{{ request.id }}</td>
+                                <td>{{ request.model_name }}</td>
+                                <td>
+                                    {% if request.status == 'completed' %}
+                                        <span class="badge bg-success">Completed</span>
+                                    {% elif request.status == 'processing' %}
+                                        <span class="badge bg-warning">Processing</span>
+                                    {% elif request.status == 'pending' %}
+                                        <span class="badge bg-info">Pending</span>
+                                    {% else %}
+                                        <span class="badge bg-danger">Failed</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ request.created_at|date:"Y-m-d H:i:s" }}</td>
+                                <td>{{ request.completed_at|date:"Y-m-d H:i:s"|default:"-" }}</td>
+                            </tr>
+                            {% empty %}
+                            <tr>
+                                <td colspan="5" class="text-center">No recent inference requests</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // Refresh dashboard data every 10 seconds
+    $(document).ready(function() {
+        setInterval(function() {
+            $.ajax({
+                url: "{% url 'recent_inferences' %}",
+                success: function(data) {
+                    // Update the table with recent inferences
+                    // This is a simplified example - in a real app, you would update the DOM
+                    console.log("Updated recent inferences data:", data);
+                    location.reload();  // Simple refresh for now
+                }
+            });
+        }, 10000);
+    });
+</script>
+{% endblock %}
+

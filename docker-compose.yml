@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  master:
+    build:
+      context: ./master
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./master:/app
+      - model_cache:/app/model_cache
+    environment:
+      - DEBUG=1
+      - SECRET_KEY=your-secret-key-change-in-production
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - MODEL_CACHE_DIR=/app/model_cache
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker1:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    volumes:
+      - ./worker:/app
+      - model_cache:/app/model_cache
+    environment:
+      - MODEL_CACHE_DIR=/app/model_cache
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  worker2:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    volumes:
+      - ./worker:/app
+      - model_cache:/app/model_cache
+    environment:
+      - MODEL_CACHE_DIR=/app/model_cache
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.0-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  model_cache:
+  redis_data:
