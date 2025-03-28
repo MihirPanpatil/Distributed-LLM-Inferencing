@@ -2,10 +2,11 @@ import os
 import sys
 import logging
 from logging.handlers import RotatingFileHandler
-from utils import get_llm_model, run_worker
+from utils import get_llm_model, run_worker, distribute_model_to_workers, create_pipeline_execution_plan
 import argparse
 import time
 import threading
+import socket
 
 class Logger:
     """
@@ -68,6 +69,41 @@ class Logger:
         """Log an exception with traceback."""
         self.logger.exception(message)
 
+def start_master_server(port=5555):
+    """
+    Start a server socket on the master node to accept worker connections.
+    
+    Args:
+        port (int): Port to listen on
+        
+    Returns:
+        socket.socket: The server socket
+    """
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(('0.0.0.0', port))
+    server_socket.listen(10)
+    return server_socket
+
+def handle_worker_connections(server_socket, worker_connections, logger):
+    """
+    Accept and handle incoming worker connections.
+    
+    Args:
+        server_socket (socket.socket): The server socket
+        worker_connections (dict): Dictionary to store worker connections
+        logger (Logger): Logger instance
+    """
+    while True:
+        try:
+            client_socket, address = server_socket.accept()
+            worker_ip = address[0]
+            logger.info(f'Worker connected from {worker_ip}')
+            worker_connections[worker_ip] = client_socket
+        except Exception as e:
+            logger.error(f'Error accepting worker connection: {str(e)}')
+            time.sleep(1)
+
 def main():
     """
     Main function to parse arguments and execute the appropriate mode (master or worker).
@@ -82,6 +118,12 @@ def main():
                       help='Model name from Huggingface (default: gpt2)')
     parser.add_argument('--master_host', type=str, 
                       help='Master node hostname (required for worker mode)')
+    parser.add_argument('--workers', type=str, nargs='+',
+                      help='List of worker node IPs/hostnames (required for master mode)')
+    parser.add_argument('--port', type=int, default=5555,
+                      help='Port for communication (default: 5555)')
+    parser.add_argument('--parallelism_type', type=str, choices=['pipeline', 'tensor', 'both'], default='both',
+                      help='Type of parallelism to use (default: both)')
     
     args = parser.parse_args()
     
@@ -97,27 +139,94 @@ def main():
         parser.print_help()
         sys.exit(1)
     
+    # Check if workers are provided for master mode
+    if args.mode == 'master' and not args.workers:
+        logger.warning("No worker nodes specified. Running in single-node mode.")
+    
     try:
         if args.mode == 'master':
             logger.info(f"Starting in master mode with model: {args.model}")
-            model = get_llm_model(args.model)
-            # Start master node functionality here
-            # For now, just keep the script running
+            logger.info(f"Using parallelism type: {args.parallelism_type}")
+            
+            # Load the model
+            model, tokenizer = get_llm_model(args.model)
+            if model is None or tokenizer is None:
+                logger.error("Failed to load model. Exiting.")
+                sys.exit(1)
+            
+            # Start a server to accept worker connections
+            server_socket = start_master_server(args.port)
+            logger.info(f"Master server started, listening on port {args.port}")
+            
+            # Dictionary to store worker connections
+            worker_connections = {}
+            
+            # Start a thread to handle incoming worker connections
+            worker_handler = threading.Thread(
+                target=handle_worker_connections, 
+                args=(server_socket, worker_connections, logger)
+            )
+            worker_handler.daemon = True
+            worker_handler.start()
+            
+            # Wait for workers to connect
+            if args.workers:
+                logger.info(f"Waiting for {len(args.workers)} workers to connect...")
+                timeout = 30  # seconds
+                start_time = time.time()
+                
+                while time.time() - start_time < timeout:
+                    connected_workers = set(worker_connections.keys())
+                    expected_workers = set(args.workers)
+                    
+                    if connected_workers.issuperset(expected_workers):
+                        logger.info("All workers connected successfully")
+                        break
+                    
+                    logger.info(f"Connected workers: {len(connected_workers)}/{len(expected_workers)}")
+                    time.sleep(2)
+                
+                # Check if all workers connected
+                if not set(worker_connections.keys()).issuperset(set(args.workers)):
+                    logger.warning("Not all workers connected within the timeout period")
+            
+            # Distribute model to workers if we have any connected
+            if worker_connections:
+                logger.info(f"Distributing model to {len(worker_connections)} workers")
+                success = distribute_model_to_workers(model, list(worker_connections.keys()), 
+                                                    parallelism_type=args.parallelism_type)
+                if success:
+                    logger.info("Model distributed successfully")
+                    
+                    # Create a pipeline execution plan for coordinating inference
+                    execution_plan = create_pipeline_execution_plan(
+                        list(worker_connections.keys()), 
+                        args.parallelism_type
+                    )
+                    logger.info(f"Created execution plan: {execution_plan}")
+                else:
+                    logger.error("Failed to distribute model")
+            
+            # For testing, keep the master node running
+            logger.info("Master node is running. Press Ctrl+C to exit.")
             while True:
                 time.sleep(10)
         
         elif args.mode == 'worker':
-            logger.info(f"Starting in worker mode, connecting to master: {args.master_host}")
-            worker_thread = threading.Thread(target=run_worker, args=(args.master_host,))
+            logger.info(f"Starting in worker mode, connecting to master: {args.master_host}:{args.port}")
+            worker_thread = threading.Thread(target=run_worker, args=(args.master_host, args.port))
             worker_thread.daemon = True
             worker_thread.start()
             
             # Keep the main thread running
+            logger.info("Worker node is running. Press Ctrl+C to exit.")
             while True:
                 time.sleep(10)
     
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+        if args.mode == 'master' and 'server_socket' in locals():
+            server_socket.close()
     except Exception as e:
         logger.exception(f"An error occurred: {str(e)}")
         sys.exit(1)
