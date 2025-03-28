@@ -5,8 +5,7 @@ from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
-from shard_mgmt.models import WorkerNode, ModelShard, InferenceRequest
-from shard_mgmt.forms import InferenceForm
+from shard_mgmt.models import WorkerNode, InferenceRequest
 import logging
 
 # Set up logging
@@ -36,6 +35,7 @@ def dashboard(request):
 
 def inference(request):
     """View for submitting inference requests."""
+    from shard_mgmt.forms import InferenceForm
     form = InferenceForm()
     recent_requests = InferenceRequest.objects.order_by('-created_at')[:10]
     
