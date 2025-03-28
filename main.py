@@ -107,7 +107,8 @@ def handle_worker_connections(server_socket, worker_connections, logger):
 
 def create_pipeline_execution_plan(worker_ips, parallelism_type):
     """
-    Create a pipeline execution plan for distributed inference.
+    Create a pipeline execution plan for distributed inference with enhanced
+    support for pipeline and tensor parallelism.
     
     Args:
         worker_ips (list): List of worker IP addresses
@@ -122,6 +123,7 @@ def create_pipeline_execution_plan(worker_ips, parallelism_type):
         'num_workers': num_workers,
         'worker_assignments': {},
         'communication_pattern': {},
+        'execution_sequence': []
     }
     
     if parallelism_type == 'pipeline':
@@ -138,6 +140,9 @@ def create_pipeline_execution_plan(worker_ips, parallelism_type):
         for i in range(num_workers - 1):
             execution_plan['communication_pattern'][worker_ips[i]] = [worker_ips[i+1]]
             
+        # Define execution sequence (pipeline order)
+        execution_plan['execution_sequence'] = worker_ips
+            
     elif parallelism_type == 'tensor':
         # In tensor parallelism, each worker handles part of each layer's computation
         for i, worker_ip in enumerate(worker_ips):
@@ -145,7 +150,11 @@ def create_pipeline_execution_plan(worker_ips, parallelism_type):
                 'task_type': 'tensor_partition',
                 'partition_id': i,
                 'total_partitions': num_workers,
-                'all_workers': worker_ips
+                'all_workers': worker_ips,
+                'weight_range': {
+                    'start': i / num_workers,
+                    'end': (i + 1) / num_workers
+                }
             }
             
         # All workers need to communicate with each other for tensor ops
@@ -154,12 +163,17 @@ def create_pipeline_execution_plan(worker_ips, parallelism_type):
                 w for w in worker_ips if w != worker_ip
             ]
             
+        # In tensor parallelism, execution is parallel
+        execution_plan['execution_sequence'] = [worker_ips]
+            
     else:  # 'both'
         # Combine pipeline and tensor parallelism
         pipeline_stages = max(2, num_workers // 2)
         tensor_partitions_per_stage = max(2, num_workers // pipeline_stages)
         
         worker_idx = 0
+        stage_workers_list = []
+        
         for stage in range(pipeline_stages):
             stage_workers = []
             
@@ -170,17 +184,20 @@ def create_pipeline_execution_plan(worker_ips, parallelism_type):
                         'task_type': 'combined',
                         'pipeline_stage': stage,
                         'tensor_partition': partition,
-                        'total_partitions_in_stage': min(tensor_partitions_per_stage, num_workers - (stage * tensor_partitions_per_stage))
+                        'total_partitions_in_stage': min(tensor_partitions_per_stage, num_workers - (stage * tensor_partitions_per_stage)),
+                        'weight_range': {
+                            'start': partition / tensor_partitions_per_stage,
+                            'end': (partition + 1) / tensor_partitions_per_stage
+                        }
                     }
                     stage_workers.append(worker_ip)
                     worker_idx += 1
             
+            stage_workers_list.append(stage_workers)
+            
             # Define communication patterns for pipeline and tensor parallelism
             if stage > 0:
-                previous_stage_workers = [
-                    w for w, data in execution_plan['worker_assignments'].items()
-                    if data.get('pipeline_stage') == stage - 1
-                ]
+                previous_stage_workers = stage_workers_list[stage - 1]
                 
                 # Pipeline communication between stages
                 for worker in stage_workers:
@@ -193,12 +210,16 @@ def create_pipeline_execution_plan(worker_ips, parallelism_type):
             for worker in stage_workers:
                 other_stage_workers = [w for w in stage_workers if w != worker]
                 execution_plan['communication_pattern'].setdefault(worker, []).extend(other_stage_workers)
+        
+        # Define execution sequence for combined approach (stage by stage)
+        execution_plan['execution_sequence'] = stage_workers_list
     
     return execution_plan
 
 def process_inference_request(input_text, model, tokenizer, worker_connections, execution_plan, logger):
     """
-    Process an inference request using distributed inference.
+    Process an inference request using distributed inference with enhanced support for 
+    both pipeline and tensor parallelism.
     
     Args:
         input_text (str): Input text for inference
@@ -213,103 +234,8 @@ def process_inference_request(input_text, model, tokenizer, worker_connections, 
     """
     logger.info('Processing inference request through distributed system')
     
-    parallelism_type = execution_plan['parallelism_type']
-    
-    if parallelism_type == 'pipeline':
-        # Find the first worker in the pipeline
-        first_stage_workers = [
-            ip for ip, assignment in execution_plan['worker_assignments'].items()
-            if assignment.get('stage_id') == 0 or assignment.get('pipeline_stage') == 0
-        ]
-        
-        if not first_stage_workers:
-            logger.error('No workers found for first pipeline stage')
-            return 'Error: Pipeline configuration issue'
-        
-        first_worker = first_stage_workers[0]
-        worker_socket = worker_connections.get(first_worker)
-        
-        if not worker_socket:
-            logger.error(f'No connection found for worker: {first_worker}')
-            return 'Error: Worker connection lost'
-        
-        # Send the input to the first stage
-        request = {
-            'command': 'process_input',
-            'input_data': input_text,
-            'execution_info': {
-                'parallelism_type': 'pipeline',
-                'is_first_stage': True
-            }
-        }
-        
-        worker_socket.send(json.dumps(request).encode())
-        logger.info(f'Sent input to first pipeline stage worker: {first_worker}')
-        
-        # In a real implementation, we'd need to track the pipeline progress
-        # and collect the final result. For now, simulate with a wait.
-        time.sleep(2)
-        
-        # Simulate receiving final result from last stage
-        result = f'Pipeline processed result for: {input_text}'
-        
-    elif parallelism_type == 'tensor':
-        # Send the same input to all tensor workers
-        for worker_ip, worker_socket in worker_connections.items():
-            request = {
-                'command': 'process_input',
-                'input_data': input_text,
-                'execution_info': {
-                    'parallelism_type': 'tensor'
-                }
-            }
-            
-            worker_socket.send(json.dumps(request).encode())
-            logger.info(f'Sent input to tensor worker: {worker_ip}')
-        
-        # In a real implementation, we'd collect and aggregate tensor results
-        # For now, simulate with a wait
-        time.sleep(1)
-        
-        # Simulate aggregated result
-        result = f'Tensor-parallel processed result for: {input_text}'
-        
-    else:  # 'both'
-        # Find workers for first pipeline stage
-        first_stage_workers = [
-            ip for ip, assignment in execution_plan['worker_assignments'].items()
-            if assignment.get('pipeline_stage') == 0
-        ]
-        
-        if not first_stage_workers:
-            logger.error('No workers found for first combined pipeline stage')
-            return 'Error: Combined parallelism configuration issue'
-        
-        # Send to all workers in first stage (for tensor parallelism)
-        for worker_ip in first_stage_workers:
-            worker_socket = worker_connections.get(worker_ip)
-            
-            if worker_socket:
-                request = {
-                    'command': 'process_input',
-                    'input_data': input_text,
-                    'execution_info': {
-                        'parallelism_type': 'combined',
-                        'is_first_stage': True
-                    }
-                }
-                
-                worker_socket.send(json.dumps(request).encode())
-                logger.info(f'Sent input to combined parallelism worker: {worker_ip}')
-        
-        # In a real implementation, complex coordination would happen here
-        time.sleep(3)
-        
-        # Simulate final result
-        result = f'Combined pipeline/tensor result for: {input_text}'
-    
-    logger.info('Distributed inference processing completed')
-    return result
+    # For true distributed inference, use the distributed_inference function
+    return distributed_inference(model, tokenizer, input_text, worker_connections, execution_plan)
 
 def main():
     """
@@ -333,6 +259,10 @@ def main():
                       default='both', help='Type of parallelism to use (default: both)')
     parser.add_argument('--input_text', type=str, 
                       help='Input text for inference testing (master mode only)')
+    parser.add_argument('--num_layers_per_stage', type=int, default=2,
+                      help='Number of transformer layers per pipeline stage (default: 2)')
+    parser.add_argument('--tensor_parallel_size', type=int, default=2,
+                      help='Size of tensor parallelism dimension (default: 2)')
     
     args = parser.parse_args()
     
@@ -403,26 +333,34 @@ def main():
             if worker_connections:
                 logger.info(f"Creating model shards for {len(worker_connections)} workers")
                 
-                # Initialize shards
-                shards = shard_model(model, len(worker_connections), args.parallelism_type)
+                # Additional sharding parameters
+                sharding_params = {
+                    'num_layers_per_stage': args.num_layers_per_stage,
+                    'tensor_parallel_size': args.tensor_parallel_size
+                }
+                
+                # Initialize shards with enhanced sharding logic
+                shards = shard_model(model, len(worker_connections), args.parallelism_type, **sharding_params)
                 logger.info(f"Created {len(shards)} shards using {args.parallelism_type} parallelism")
                 
-                # Create execution plan for distributed inference
+                # Create enhanced execution plan for distributed inference
                 execution_plan = create_pipeline_execution_plan(
                     list(worker_connections.keys()),
                     args.parallelism_type
                 )
-                logger.info("Created pipeline execution plan")
+                logger.info("Created pipeline execution plan with improved coordination")
                 
-                # Distribute model shards to workers
+                # Distribute model shards to workers with enhanced distribution
                 success = distribute_model_to_workers(
                     model, 
                     list(worker_connections.keys()),
-                    args.parallelism_type
+                    args.parallelism_type,
+                    shards=shards,
+                    execution_plan=execution_plan
                 )
                 
                 if success:
-                    logger.info("Model shards distributed successfully")
+                    logger.info("Model shards distributed successfully across workers")
                     
                     # Process an inference request if input_text is provided
                     if args.input_text:
@@ -435,9 +373,9 @@ def main():
                             execution_plan,
                             logger
                         )
-                        logger.info(f"Inference result: {result}")
+                        logger.info(f"Distributed inference result: {result}")
                 else:
-                    logger.error("Failed to distribute model shards")
+                    logger.error("Failed to distribute model shards to workers")
             
             # Keep the master node running to accept commands
             logger.info("Master node is running. Press Ctrl+C to exit.")
@@ -446,7 +384,7 @@ def main():
         
         elif args.mode == 'worker':
             logger.info(f"Starting in worker mode, connecting to master: {args.master_host}:{args.port}")
-            worker_thread = threading.Thread(target=run_worker, args=(args.master_host, args.port))
+            worker_thread = threading.Thread(target=run_worker, args=(args.master_host, args.port, args.parallelism_type))
             worker_thread.daemon = True
             worker_thread.start()
             
