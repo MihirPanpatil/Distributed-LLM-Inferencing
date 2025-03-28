@@ -11,27 +11,87 @@ The architecture follows a STAR topology with a single Master Node (Hub) coordin
 
 ## Project Structure
 
-The project is organized into the following main components:
+The project is organized with a clear separation of responsibilities between components:
 
-- **master/**: Contains the Django-based Master Node implementation that:
-  - Manages the web dashboard for user interaction
-  - Coordinates inference tasks across worker nodes
-  - Handles model management and sharding configuration
-  - Processes result aggregation from workers
+### Master Node (`master/`)
 
-- **worker/**: Contains the Flask-based Worker Node implementation that:
-  - Loads and runs LLM inference tasks
-  - Manages local model caching
-  - Handles tensor parallelism for distributed inference
-  - Reports status and results back to the master node
+The Django-based Master Node serves as the central coordinator for the entire system:
 
-- **docker-compose.yml**: Defines the multi-container Docker application with:
-  - Service definitions for master and worker nodes
-  - Network configuration for node communication
-  - Volume mappings for persistent model storage
-  - Environment variable settings for customization
+- **`master/settings.py`**: Django configuration file containing database settings, Redis connection parameters, and security configurations.
+- **`master/urls.py`**: URL routing definitions for the web dashboard and REST API endpoints.
+- **`master/models/`**:
+  - **`node.py`**: Defines the `WorkerNode` model for tracking connected worker instances, their capabilities, and health status.
+  - **`request.py`**: Contains the `InferenceRequest` model that tracks user prompts, assigned workers, and inference results.
+  - **`model.py`**: Implements the `LLMModel` and `ModelShard` models for tracking available models and their distribution across workers.
 
-This modular architecture allows for easy scaling by adding more worker nodes as needed, while maintaining a single point of control through the master node.
+- **`master/views/`**:
+  - **`dashboard.py`**: Renders the main web interface for users to submit prompts and monitor inference.
+  - **`api.py`**: REST API endpoints for worker registration, status updates, and result collection.
+  - **`nodes.py`**: Node management interface for adding, testing, and removing worker nodes.
+
+- **`master/services/`**:
+  - **`orchestrator.py`**: Core logic for distributing inference tasks across available worker nodes.
+  - **`sharding.py`**: Handles model partitioning for large models that need to be split across multiple workers.
+  - **`result_aggregator.py`**: Collects and combines partial results from workers for final output.
+
+- **`master/static/`**: Contains CSS, JavaScript, and image files for the web dashboard.
+- **`master/templates/`**: HTML templates for the user interface.
+
+### Worker Node (`worker/`)
+
+The Flask-based Worker Node handles the actual model loading and inference execution:
+
+- **`worker/app.py`**: Main Flask application that defines API endpoints for the master to communicate with.
+- **`worker/models/`**:
+  - **`model_manager.py`**: Handles downloading, caching, and loading of LLM models from Hugging Face.
+  - **`inference.py`**: Contains the inference pipeline that processes prompts using loaded models.
+  - **`sharded_model.py`**: Implements specialized handling for partial model shards in distributed inference.
+
+- **`worker/utils/`**:
+  - **`gpu_utils.py`**: Utilities for GPU memory management and CUDA optimization.
+  - **`cache.py`**: Model caching functions to avoid redundant downloads.
+  - **`auth.py`**: Authentication mechanisms for secure communication with the master.
+
+- **`worker/config.py`**: Configuration parameters and environment variable processing.
+- **`worker/requirements.txt`**: Python dependencies specific to worker nodes.
+
+### Docker Configuration (`docker-compose.yml`)
+
+The Docker Compose configuration orchestrates multi-container deployment:
+
+- **Services**:
+  - **`master`**: Configures the Django master service with network settings and volume mounts.
+  - **`worker1`, `worker2`, etc.**: Worker node services that can be scaled horizontally.
+  - **`redis`**: Message broker for asynchronous communication between nodes.
+
+- **Networks**: Defines internal networks for secure container communication.
+- **Volumes**: 
+  - **`model-cache`**: Persistent storage for downloaded models.
+  - **`db-data`**: Database persistence for the master node.
+
+- **Environment Variables**: Configuration for GPU support, authentication, and service discovery.
+
+### Data Flow and Request Lifecycle
+
+A typical inference request follows this path through the system:
+
+1. User submits a prompt through the master node's web interface
+2. Master's `orchestrator.py` analyzes the request and selected model
+3. For standard models:
+   - Master selects the most available worker node
+   - Request is forwarded to the worker via REST API
+   - Worker performs inference and returns results
+   
+4. For sharded models:
+   - Master's `sharding.py` divides the model into parts
+   - Parts are assigned to different workers based on capability and load
+   - Workers load their respective shards
+   - Inference is performed in coordinated fashion, with intermediate tensors passed between workers
+   - Final worker in the chain returns complete results
+   
+5. Results are stored in the database and displayed to the user
+
+This architecture allows for flexible scaling and efficient use of distributed computing resources for LLM inference.
 
 ## Prerequisites
 
