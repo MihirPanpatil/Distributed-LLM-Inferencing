@@ -9,6 +9,30 @@ The architecture follows a STAR topology with a single Master Node (Hub) coordin
 - **Master Node (Hub)**: Acts as the centralized controller and the single point of inference for the user.
 - **Worker Nodes**: Operate on the local network and connect to the Master Node.
 
+## Project Structure
+
+The project is organized into the following main components:
+
+- **master/**: Contains the Django-based Master Node implementation that:
+  - Manages the web dashboard for user interaction
+  - Coordinates inference tasks across worker nodes
+  - Handles model management and sharding configuration
+  - Processes result aggregation from workers
+
+- **worker/**: Contains the Flask-based Worker Node implementation that:
+  - Loads and runs LLM inference tasks
+  - Manages local model caching
+  - Handles tensor parallelism for distributed inference
+  - Reports status and results back to the master node
+
+- **docker-compose.yml**: Defines the multi-container Docker application with:
+  - Service definitions for master and worker nodes
+  - Network configuration for node communication
+  - Volume mappings for persistent model storage
+  - Environment variable settings for customization
+
+This modular architecture allows for easy scaling by adding more worker nodes as needed, while maintaining a single point of control through the master node.
+
 ## Prerequisites
 
 - Python 3.9 or higher
