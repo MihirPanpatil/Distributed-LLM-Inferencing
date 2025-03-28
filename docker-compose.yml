@@ -5,6 +5,8 @@ services:
     build:
       context: ./master
       dockerfile: Dockerfile
+      args:
+        - USE_GPU=0
     ports:
       - "8000:8000"
     volumes:
@@ -17,6 +19,7 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=0
       - MODEL_CACHE_DIR=/app/model_cache
+      - USE_GPU=0
     depends_on:
       - redis
     restart: unless-stopped
@@ -25,29 +28,30 @@ services:
     build:
       context: ./worker
       dockerfile: Dockerfile
+      args:
+        - USE_GPU=0
     volumes:
       - ./worker:/app
       - model_cache:/app/model_cache
     environment:
       - MODEL_CACHE_DIR=/app/model_cache
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - USE_GPU=0
+      - AUTH_ENABLED=0
     restart: unless-stopped
 
   worker2:
     build:
       context: ./worker
       dockerfile: Dockerfile
+      args:
+        - USE_GPU=0
     volumes:
       - ./worker:/app
       - model_cache:/app/model_cache
     environment:
       - MODEL_CACHE_DIR=/app/model_cache
+      - USE_GPU=0
+      - AUTH_ENABLED=0
     restart: unless-stopped
 
   redis:
