@@ -2,8 +2,11 @@ import os
 import json
 import psutil
 import torch
+import paramiko
+import time
 from flask import Flask, request, jsonify
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -16,7 +19,35 @@ loaded_shards = {}
 MODEL_CACHE_DIR = os.environ.get('MODEL_CACHE_DIR', '/app/model_cache')
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
+# Get GPU usage preference from environment
+USE_GPU = os.environ.get('USE_GPU', '0') == '1'
+
+# Determine device based on availability and preference
+DEVICE = 'cuda' if torch.cuda.is_available() and USE_GPU else 'cpu'
+
+# Auth configuration for secure communication
+AUTH_ENABLED = os.environ.get('AUTH_ENABLED', '0') == '1'
+AUTH_KEY = os.environ.get('AUTH_KEY', '')
+
+def require_auth(f):
+    """Decorator to require authentication for endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not AUTH_ENABLED:
+            return f(*args, **kwargs)
+        
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or auth_header != f'Bearer {AUTH_KEY}':
+            return jsonify({
+                'status': 'error',
+                'message': 'Unauthorized access'
+            }), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route('/health', methods=['GET'])
+@require_auth
 def health_check():
     """Endpoint to check worker health and resource usage."""
     # Get system resource usage
@@ -26,7 +57,7 @@ def health_check():
     
     # Check GPU usage if available
     gpu_percent = 0.0
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and USE_GPU:
         try:
             # This is a simplified approach - in production you'd use 
             # a proper GPU monitoring library like pynvml
@@ -52,7 +83,8 @@ def health_check():
             'cpu': cpu_percent,
             'memory': memory_percent,
             'gpu': gpu_percent,
-            'gpu_available': torch.cuda.is_available()
+            'gpu_available': torch.cuda.is_available() and USE_GPU,
+            'device': DEVICE
         },
         'loaded_models': list(loaded_models.keys()),
         'loaded_tokenizers': list(loaded_tokenizers.keys()),
@@ -60,6 +92,7 @@ def health_check():
     })
 
 @app.route('/load_model', methods=['POST'])
+@require_auth
 def load_model():
     """Endpoint to load a complete model."""
     data = request.json
@@ -87,15 +120,14 @@ def load_model():
         # Load model
         model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
         
-        # Move model to GPU if available
-        if torch.cuda.is_available():
-            model = model.to('cuda')
+        # Move model to appropriate device
+        model = model.to(DEVICE)
         
         loaded_models[model_name] = model
         
         return jsonify({
             'status': 'success',
-            'message': f'Model {model_name} loaded successfully'
+            'message': f'Model {model_name} loaded successfully on {DEVICE}'
         })
     
     except Exception as e:
@@ -105,6 +137,7 @@ def load_model():
         }), 500
 
 @app.route('/load_shard', methods=['POST'])
+@require_auth
 def load_shard():
     """Endpoint to load a model shard."""
     data = request.json
@@ -173,6 +206,7 @@ def load_shard():
         }), 500
 
 @app.route('/unload_model', methods=['POST'])
+@require_auth
 def unload_model():
     """Endpoint to unload a model."""
     data = request.json
@@ -187,6 +221,9 @@ def unload_model():
     try:
         # Unload the model
         if model_name in loaded_models:
+            # Delete the model to free up memory
+            if DEVICE == 'cuda':
+                loaded_models[model_name].cpu()
             del loaded_models[model_name]
         
         # Unload the tokenizer
@@ -198,7 +235,7 @@ def unload_model():
             del loaded_shards[model_name]
         
         # Force CUDA garbage collection
-        if torch.cuda.is_available():
+        if DEVICE == 'cuda':
             torch.cuda.empty_cache()
         
         return jsonify({
@@ -213,6 +250,7 @@ def unload_model():
         }), 500
 
 @app.route('/inference', methods=['POST'])
+@require_auth
 def run_inference():
     """Endpoint to run inference with a model."""
     data = request.json
@@ -220,6 +258,7 @@ def run_inference():
     prompt = data.get('prompt')
     max_length = data.get('max_length', 100)
     shard_ids = data.get('shard_ids')
+    timeout = data.get('timeout', 60)  # Add timeout parameter
     
     if not all([model_name, prompt]):
         return jsonify({
@@ -228,6 +267,9 @@ def run_inference():
         }), 400
     
     try:
+        # Set a timer to track execution time
+        start_time = time.time()
+        
         # Check if we're using shards
         if shard_ids:
             result = run_shard_inference(model_name, prompt, shard_ids, max_length)
@@ -236,7 +278,7 @@ def run_inference():
             if model_name not in loaded_models:
                 # Try to load the model
                 load_response = load_model()
-                if load_response[1] == 500:  # Error status code
+                if isinstance(load_response, tuple) and load_response[1] == 500:  # Error status code
                     return load_response
             
             # Get the model and tokenizer
@@ -245,8 +287,11 @@ def run_inference():
             
             # Tokenize input
             inputs = tokenizer(prompt, return_tensors="pt")
-            if torch.cuda.is_available():
-                inputs = {k: v.to('cuda') for k, v in inputs.items()}
+            inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+            
+            # Check timeout
+            if (time.time() - start_time) > timeout:
+                raise TimeoutError("Inference preparation timed out")
             
             # Generate text
             outputs = model.generate(
@@ -261,11 +306,22 @@ def run_inference():
             
             # Decode the generated text
             result = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Check timeout again
+            if (time.time() - start_time) > timeout:
+                raise TimeoutError("Inference generation timed out")
         
         return jsonify({
             'status': 'success',
-            'result': result
+            'result': result,
+            'execution_time': time.time() - start_time
         })
+    
+    except TimeoutError as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 408  # Request Timeout
     
     except Exception as e:
         return jsonify({
@@ -289,8 +345,7 @@ def run_shard_inference(model_name, prompt, shard_ids, max_length):
     shard_model_key = f"{model_name}_{shard_id}"
     if shard_model_key not in loaded_models:
         model = AutoModelForCausalLM.from_pretrained(shard_path)
-        if torch.cuda.is_available():
-            model = model.to('cuda')
+        model = model.to(DEVICE)
         loaded_models[shard_model_key] = model
     
     model = loaded_models[shard_model_key]
@@ -298,8 +353,7 @@ def run_shard_inference(model_name, prompt, shard_ids, max_length):
     
     # Tokenize input
     inputs = tokenizer(prompt, return_tensors="pt")
-    if torch.cuda.is_available():
-        inputs = {k: v.to('cuda') for k, v in inputs.items()}
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
     
     # Generate text
     outputs = model.generate(
@@ -316,6 +370,47 @@ def run_shard_inference(model_name, prompt, shard_ids, max_length):
     result = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     return result
+
+@app.route('/ssh_setup', methods=['POST'])
+@require_auth
+def setup_ssh_connection():
+    """Endpoint to set up an SSH tunnel for secure communication."""
+    data = request.json
+    host = data.get('host')
+    port = data.get('port', 22)
+    username = data.get('username')
+    password = data.get('password')
+    key_path = data.get('key_path')
+    
+    if not host or not (password or key_path) or not username:
+        return jsonify({
+            'status': 'error',
+            'message': 'Host, username, and either password or key_path are required'
+        }), 400
+    
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        if key_path:
+            key = paramiko.RSAKey.from_private_key_file(key_path)
+            client.connect(hostname=host, port=port, username=username, pkey=key)
+        else:
+            client.connect(hostname=host, port=port, username=username, password=password)
+        
+        # Close connection after successful test
+        client.close()
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'SSH connection to {host} established successfully'
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'SSH connection failed: {str(e)}'
+        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
