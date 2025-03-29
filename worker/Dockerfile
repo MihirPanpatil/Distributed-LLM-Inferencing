@@ -28,7 +28,7 @@ RUN if [ "$USE_GPU" = "1" ] ; then \
     fi
 
 # Copy application code
-COPY app.py .
+COPY . .
 
 # Create model cache directory
 RUN mkdir -p /app/model_cache
@@ -37,9 +37,10 @@ RUN mkdir -p /app/model_cache
 ENV MODEL_CACHE_DIR=/app/model_cache
 ENV PYTHONUNBUFFERED=1
 ENV USE_GPU=${USE_GPU}
+ENV DJANGO_SETTINGS_MODULE=worker.settings
 
 # Expose port
-EXPOSE 5000
+EXPOSE 8000
 
 # Run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "300", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--timeout", "300", "worker.wsgi:application"]
