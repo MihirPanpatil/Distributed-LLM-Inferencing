@@ -1,33 +1,33 @@
 import os
 import json
-import psutil
-import torch
-import paramiko
 import time
-from flask import Flask, request, jsonify
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from functools import wraps
 
+import torch
+import psutil
+import paramiko
+import requests
+from flask import Flask, request, jsonify
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 app = Flask(__name__)
+
+# Configuration
+MODEL_CACHE_DIR = os.environ.get('MODEL_CACHE_DIR', '/app/model_cache')
+USE_GPU = os.environ.get('USE_GPU', '0') == '1'
+AUTH_ENABLED = os.environ.get('AUTH_ENABLED', '0') == '1'
+AUTH_KEY = os.environ.get('AUTH_KEY', '')
+
+# Create model cache directory
+os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+
+# Determine device based on availability and preference
+DEVICE = 'cuda' if torch.cuda.is_available() and USE_GPU else 'cpu'
 
 # Global variables to track loaded models and shards
 loaded_models = {}
 loaded_tokenizers = {}
 loaded_shards = {}
-
-# Directory for model cache
-MODEL_CACHE_DIR = os.environ.get('MODEL_CACHE_DIR', '/app/model_cache')
-os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
-
-# Get GPU usage preference from environment
-USE_GPU = os.environ.get('USE_GPU', '0') == '1'
-
-# Determine device based on availability and preference
-DEVICE = 'cuda' if torch.cuda.is_available() and USE_GPU else 'cpu'
-
-# Auth configuration for secure communication
-AUTH_ENABLED = os.environ.get('AUTH_ENABLED', '0') == '1'
-AUTH_KEY = os.environ.get('AUTH_KEY', '')
 
 def require_auth(f):
     """Decorator to require authentication for endpoints."""
@@ -59,11 +59,9 @@ def health_check():
     gpu_percent = 0.0
     if torch.cuda.is_available() and USE_GPU:
         try:
-            # This is a simplified approach - in production you'd use 
-            # a proper GPU monitoring library like pynvml
             gpu_percent = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() \
                 if torch.cuda.max_memory_allocated() > 0 else 0.0
-        except:
+        except Exception:
             gpu_percent = 0.0
     
     # Get information about loaded shards
@@ -169,7 +167,6 @@ def load_shard():
             if os.path.exists(tokenizer_path):
                 tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
             else:
-                # Fall back to loading from Hugging Face
                 tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
             loaded_tokenizers[model_name] = tokenizer
         
@@ -258,7 +255,7 @@ def run_inference():
     prompt = data.get('prompt')
     max_length = data.get('max_length', 100)
     shard_ids = data.get('shard_ids')
-    timeout = data.get('timeout', 60)  # Add timeout parameter
+    timeout = data.get('timeout', 60)
     
     if not all([model_name, prompt]):
         return jsonify({
@@ -278,7 +275,7 @@ def run_inference():
             if model_name not in loaded_models:
                 # Try to load the model
                 load_response = load_model()
-                if isinstance(load_response, tuple) and load_response[1] == 500:  # Error status code
+                if isinstance(load_response, tuple) and load_response[1] == 500:
                     return load_response
             
             # Get the model and tokenizer
@@ -332,7 +329,6 @@ def run_inference():
 def run_shard_inference(model_name, prompt, shard_ids, max_length):
     """Run inference using model shards."""
     # For simplicity, we'll just use the first shard for now
-    # In a real implementation, you would coordinate between shards
     shard_id = shard_ids[0]
     
     if shard_id not in loaded_shards.get(model_name, {}):
