@@ -1,14 +1,15 @@
 import json
 import requests
+import threading
+import logging
 from django.shortcuts import render, get_object_or_404
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+from django.db import transaction
 from .models import WorkerNode, ModelShard, InferenceRequest
 from .forms import WorkerNodeForm, InferenceForm
-import threading
-import logging
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -88,21 +89,37 @@ def node_status(request):
         # Try to get node health information
         if node.is_active:
             try:
-                response = requests.get(f"{node.get_url()}/health", timeout=5)
+                # Add timeout to prevent hanging requests
+                response = requests.get(
+                    f"{node.get_url()}/health", 
+                    timeout=5,
+                    headers={'Content-Type': 'application/json'}
+                )
+                
                 if response.status_code == 200:
-                    health_data = response.json()
-                    node_data['resources'] = health_data.get('resources', {})
-                    node_data['loaded_shards'] = health_data.get('loaded_shards', [])
-                    # Update heartbeat time when successful health check
-                    node.last_heartbeat = timezone.now()
-                    node.save(update_fields=['last_heartbeat'])
+                    try:
+                        health_data = response.json()
+                        node_data['resources'] = health_data.get('resources', {})
+                        node_data['loaded_shards'] = health_data.get('loaded_shards', [])
+                        # Update heartbeat time when successful health check
+                        WorkerNode.objects.filter(id=node.id).update(
+                            last_heartbeat=timezone.now()
+                        )
+                    except ValueError as e:
+                        node_data['error'] = f'Invalid JSON response: {str(e)}'
+                        logger.warning(f'Invalid JSON from node {node.hostname}: {str(e)}')
+                else:
+                    node_data['error'] = f'HTTP {response.status_code}: {response.text}'
+                    logger.warning(f'Health check failed for node {node.hostname} with HTTP {response.status_code}')
+                    # Mark node as inactive if response is not 200
+                    if node.is_active:
+                        WorkerNode.objects.filter(id=node.id).update(is_active=False)
             except requests.RequestException as e:
                 node_data['error'] = f'Connection error: {str(e)}'
                 logger.warning(f'Health check failed for node {node.hostname}: {str(e)}')
                 # Mark node as inactive if we can't reach it
                 if node.is_active:
-                    node.is_active = False
-                    node.save(update_fields=['is_active'])
+                    WorkerNode.objects.filter(id=node.id).update(is_active=False)
         
         nodes.append(node_data)
     
@@ -119,10 +136,37 @@ def add_node(request):
         
         # Check if the node is reachable
         try:
-            response = requests.get(f"{node.get_url()}/health", timeout=5)
+            response = requests.get(
+                f"{node.get_url()}/health", 
+                timeout=5,
+                headers={'Content-Type': 'application/json'}
+            )
+            
             if response.status_code == 200:
-                node.is_active = True
-                node.last_heartbeat = timezone.now()
+                try:
+                    # Validate that response is proper JSON
+                    health_data = response.json()
+                    node.is_active = True
+                    node.last_heartbeat = timezone.now()
+                    node.save()
+                    
+                    # Store success message in session for UI feedback
+                    request.session['status_message'] = f'Node {node.hostname} ({node.ip_address}) added successfully'
+                    request.session['status_type'] = 'success'
+                    
+                    logger.info(f'Node {node.hostname} ({node.ip_address}) added successfully')
+                    
+                    return JsonResponse({
+                        'status': 'success',
+                        'node_id': node.id,
+                        'hostname': node.hostname,
+                        'message': f'Node {node.hostname} added successfully'
+                    })
+                except ValueError as e:
+                    return JsonResponse({
+                        'status': 'error',
+                        'message': f'Node returned invalid JSON: {str(e)}'
+                    }, status=400)
             else:
                 return JsonResponse({
                     'status': 'error',
@@ -134,26 +178,11 @@ def add_node(request):
                 'message': f'Could not connect to node: {str(e)}. Please check the hostname, IP, and port.'
             }, status=400)
         except Exception as e:
-            logger.error(f'Unexpected error adding node: {str(e)}')
+            logger.error(f'Unexpected error adding node: {str(e)}', exc_info=True)
             return JsonResponse({
                 'status': 'error',
                 'message': f'An unexpected error occurred: {str(e)}'
             }, status=500)
-        
-        node.save()
-        
-        # Store success message in session for UI feedback
-        request.session['status_message'] = f'Node {node.hostname} ({node.ip_address}) added successfully'
-        request.session['status_type'] = 'success'
-        
-        logger.info(f'Node {node.hostname} ({node.ip_address}) added successfully')
-        
-        return JsonResponse({
-            'status': 'success',
-            'node_id': node.id,
-            'hostname': node.hostname,
-            'message': f'Node {node.hostname} added successfully'
-        })
     else:
         # Provide detailed form validation errors
         error_details = {field: errors for field, errors in form.errors.items()}
@@ -169,49 +198,52 @@ def add_node(request):
 def remove_node(request, node_id):
     """API endpoint to remove a worker node."""
     try:
-        node = get_object_or_404(WorkerNode, id=node_id)
-        hostname = node.hostname
-        
-        # Unload any model shards from this node
-        unload_errors = []
-        for shard in node.shards.all():
-            try:
-                response = requests.post(
-                    f"{node.get_url()}/unload_model",
-                    json={'model_name': shard.model_name},
-                    timeout=10
-                )
-                if response.status_code != 200:
-                    unload_errors.append(f"Failed to unload shard {shard.shard_id} of model {shard.model_name}: {response.text}")
-            except requests.RequestException as e:
-                unload_errors.append(f"Connection error while unloading shard {shard.shard_id}: {str(e)}")
-            except Exception as e:
-                unload_errors.append(f"Unexpected error unloading shard {shard.shard_id}: {str(e)}")
-        
-        # Delete the node
-        node.delete()
-        
-        # Record success/warning message for UI feedback
-        if unload_errors:
-            message = f"Node {hostname} removed, but with warnings: {'; '.join(unload_errors)}"
-            request.session['status_type'] = 'warning'
-            logger.warning(message)
-        else:
-            message = f"Node {hostname} removed successfully"
-            request.session['status_type'] = 'success'
-            logger.info(message)
-        
-        request.session['status_message'] = message
-        
-        return JsonResponse({
-            'status': 'success',
-            'message': message,
-            'warnings': unload_errors if unload_errors else None
-        })
+        with transaction.atomic():
+            node = get_object_or_404(WorkerNode, id=node_id)
+            hostname = node.hostname
+            
+            # Unload any model shards from this node
+            unload_errors = []
+            if node.is_active:
+                for shard in node.shards.all():
+                    try:
+                        response = requests.post(
+                            f"{node.get_url()}/unload_model",
+                            json={'model_name': shard.model_name},
+                            timeout=10,
+                            headers={'Content-Type': 'application/json'}
+                        )
+                        if response.status_code != 200:
+                            unload_errors.append(f"Failed to unload shard {shard.shard_id} of model {shard.model_name}: {response.text}")
+                    except requests.RequestException as e:
+                        unload_errors.append(f"Connection error while unloading shard {shard.shard_id}: {str(e)}")
+                    except Exception as e:
+                        unload_errors.append(f"Unexpected error unloading shard {shard.shard_id}: {str(e)}")
+            
+            # Delete the node
+            node.delete()
+            
+            # Record success/warning message for UI feedback
+            if unload_errors:
+                message = f"Node {hostname} removed, but with warnings: {'; '.join(unload_errors)}"
+                request.session['status_type'] = 'warning'
+                logger.warning(message)
+            else:
+                message = f"Node {hostname} removed successfully"
+                request.session['status_type'] = 'success'
+                logger.info(message)
+            
+            request.session['status_message'] = message
+            
+            return JsonResponse({
+                'status': 'success',
+                'message': message,
+                'warnings': unload_errors if unload_errors else None
+            })
     
     except Exception as e:
         error_message = f"Failed to remove node: {str(e)}"
-        logger.error(error_message)
+        logger.error(error_message, exc_info=True)
         request.session['status_message'] = error_message
         request.session['status_type'] = 'error'
         
@@ -232,7 +264,8 @@ def submit_inference(request):
         # Start processing in a background thread
         threading.Thread(
             target=process_inference_request,
-            args=(inference_request.id,)
+            args=(inference_request.id,),
+            daemon=True  # Ensure thread doesn't block application shutdown
         ).start()
         
         # Store success message in session for UI feedback
@@ -273,7 +306,7 @@ def inference_status(request, request_id):
             'completed_at': inference_request.completed_at.isoformat() if inference_request.completed_at else None
         })
     except Exception as e:
-        logger.error(f'Error getting inference status: {str(e)}')
+        logger.error(f'Error getting inference status: {str(e)}', exc_info=True)
         return JsonResponse({
             'status': 'error',
             'message': f'Error retrieving inference status: {str(e)}'
@@ -296,7 +329,7 @@ def recent_inferences(request):
         
         return JsonResponse({'requests': requests_data})
     except Exception as e:
-        logger.error(f'Error getting recent inferences: {str(e)}')
+        logger.error(f'Error getting recent inferences: {str(e)}', exc_info=True)
         return JsonResponse({
             'status': 'error',
             'message': f'Error retrieving recent inferences: {str(e)}'
@@ -305,12 +338,12 @@ def recent_inferences(request):
 def process_inference_request(request_id):
     """Background task to process an inference request."""
     try:
-        inference_request = InferenceRequest.objects.get(id=request_id)
-        inference_request.status = 'processing'
-        inference_request.save(update_fields=['status'])
-        
+        # Update request status to processing
+        InferenceRequest.objects.filter(id=request_id).update(status='processing')
         logger.info(f'Processing inference request {request_id}')
         
+        # Fetch the request after updating status
+        inference_request = InferenceRequest.objects.get(id=request_id)
         model_name = inference_request.model_name
         prompt = inference_request.prompt
         
@@ -319,131 +352,12 @@ def process_inference_request(request_id):
         
         if shards.exists():
             # Distributed inference with shards
-            try:
-                # Group shards by node
-                node_shards = {}
-                for shard in shards:
-                    if shard.node.is_active:
-                        if shard.node.id not in node_shards:
-                            node_shards[shard.node.id] = {
-                                'node': shard.node,
-                                'shard_ids': []
-                            }
-                        node_shards[shard.node.id]['shard_ids'].append(shard.shard_id)
-                
-                if not node_shards:
-                    raise Exception("No active nodes with loaded shards found")
-                
-                # For simplicity, use the first node that has shards
-                node_info = list(node_shards.values())[0]
-                node = node_info['node']
-                shard_ids = node_info['shard_ids']
-                
-                logger.info(f'Using node {node.hostname} with shards {shard_ids} for request {request_id}')
-                
-                # Send inference request to the node
-                response = requests.post(
-                    f"{node.get_url()}/inference",
-                    json={
-                        'model_name': model_name,
-                        'prompt': prompt,
-                        'shard_ids': shard_ids,
-                        'max_length': 100,  # Default value, could be configurable
-                        'timeout': 60  # Add timeout parameter
-                    },
-                    timeout=120  # Extended timeout for the HTTP request itself
-                )
-                
-                if response.status_code == 200:
-                    result_data = response.json()
-                    if result_data.get('status') == 'success':
-                        inference_request.mark_completed(result_data.get('result', ''))
-                        logger.info(f'Inference request {request_id} completed successfully')
-                    else:
-                        error_message = result_data.get('message', 'Unknown error')
-                        inference_request.mark_failed(error_message)
-                        logger.error(f'Inference request {request_id} failed: {error_message}')
-                else:
-                    error_message = f"Node returned status code {response.status_code}: {response.text}"
-                    inference_request.mark_failed(error_message)
-                    logger.error(error_message)
-            
-            except requests.RequestException as e:
-                error_message = f"Connection error: {str(e)}"
-                inference_request.mark_failed(error_message)
-                logger.error(f'Inference request {request_id} failed: {error_message}')
-            except Exception as e:
-                error_message = str(e)
-                inference_request.mark_failed(error_message)
-                logger.error(f'Inference request {request_id} failed: {error_message}')
-        
+            handle_sharded_inference(inference_request, shards)
         else:
             # Try to find a node that can load the complete model
-            active_nodes = WorkerNode.objects.filter(is_active=True)
-            
-            if not active_nodes.exists():
-                inference_request.mark_failed("No active worker nodes available")
-                logger.error(f'Inference request {request_id} failed: No active worker nodes available')
-                return
-            
-            # For simplicity, use the first active node
-            # In a real system, you would select based on load, capabilities, etc.
-            node = active_nodes.first()
-            
-            try:
-                logger.info(f'Loading model {model_name} on node {node.hostname} for request {request_id}')
-                
-                # First, try to load the model if not already loaded
-                load_response = requests.post(
-                    f"{node.get_url()}/load_model",
-                    json={'model_name': model_name},
-                    timeout=300  # Loading can take time
-                )
-                
-                if load_response.status_code != 200:
-                    error_message = f"Failed to load model: {load_response.text}"
-                    inference_request.mark_failed(error_message)
-                    logger.error(f'Inference request {request_id} failed: {error_message}')
-                    return
-                
-                logger.info(f'Model {model_name} loaded successfully on node {node.hostname}')
-                
-                # Now run inference
-                response = requests.post(
-                    f"{node.get_url()}/inference",
-                    json={
-                        'model_name': model_name,
-                        'prompt': prompt,
-                        'max_length': 100,  # Default value, could be configurable
-                        'timeout': 60  # Add timeout parameter
-                    },
-                    timeout=120  # Extended timeout for the HTTP request itself
-                )
-                
-                if response.status_code == 200:
-                    result_data = response.json()
-                    if result_data.get('status') == 'success':
-                        inference_request.mark_completed(result_data.get('result', ''))
-                        logger.info(f'Inference request {request_id} completed successfully')
-                    else:
-                        error_message = result_data.get('message', 'Unknown error')
-                        inference_request.mark_failed(error_message)
-                        logger.error(f'Inference request {request_id} failed: {error_message}')
-                else:
-                    error_message = f"Node returned status code {response.status_code}: {response.text}"
-                    inference_request.mark_failed(error_message)
-                    logger.error(error_message)
-            
-            except requests.RequestException as e:
-                error_message = f"Connection error: {str(e)}"
-                inference_request.mark_failed(error_message)
-                logger.error(f'Inference request {request_id} failed: {error_message}')
-            except Exception as e:
-                error_message = str(e)
-                inference_request.mark_failed(error_message)
-                logger.error(f'Inference request {request_id} failed: {error_message}')
+            handle_full_model_inference(inference_request)
     except Exception as e:
-        logger.critical(f'Fatal error processing inference request {request_id}: {str(e)}')
+        logger.critical(f'Fatal error processing inference request {request_id}: {str(e)}', exc_info=True)
         try:
             # Try to update the request status if possible
             InferenceRequest.objects.filter(id=request_id).update(
@@ -451,5 +365,135 @@ def process_inference_request(request_id):
                 error=f'Fatal error: {str(e)}',
                 completed_at=timezone.now()
             )
-        except:
-            pass  # If we can't update the database, we've already logged the error
+        except Exception as nested_e:
+            logger.critical(f'Failed to update request {request_id} status after error: {str(nested_e)}')
+
+def handle_sharded_inference(inference_request, shards):
+    """Handle inference using model shards."""
+    try:
+        # Group shards by node
+        node_shards = {}
+        for shard in shards:
+            if shard.node.is_active:
+                if shard.node.id not in node_shards:
+                    node_shards[shard.node.id] = {
+                        'node': shard.node,
+                        'shard_ids': []
+                    }
+                node_shards[shard.node.id]['shard_ids'].append(shard.shard_id)
+        
+        if not node_shards:
+            raise Exception("No active nodes with loaded shards found")
+        
+        # For simplicity, use the first node that has shards
+        node_info = list(node_shards.values())[0]
+        node = node_info['node']
+        shard_ids = node_info['shard_ids']
+        
+        logger.info(f'Using node {node.hostname} with shards {shard_ids} for request {inference_request.id}')
+        
+        # Send inference request to the node
+        response = requests.post(
+            f"{node.get_url()}/inference",
+            json={
+                'model_name': inference_request.model_name,
+                'prompt': inference_request.prompt,
+                'shard_ids': shard_ids,
+                'max_length': 100,  # Default value, could be configurable
+                'timeout': 60  # Add timeout parameter
+            },
+            timeout=120,  # Extended timeout for the HTTP request itself
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        process_inference_response(inference_request, response)
+    except requests.RequestException as e:
+        error_message = f"Connection error: {str(e)}"
+        inference_request.mark_failed(error_message)
+        logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+    except Exception as e:
+        error_message = str(e)
+        inference_request.mark_failed(error_message)
+        logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+
+def handle_full_model_inference(inference_request):
+    """Handle inference using a full model on a single node."""
+    # Find active nodes
+    active_nodes = WorkerNode.objects.filter(is_active=True)
+    
+    if not active_nodes.exists():
+        inference_request.mark_failed("No active worker nodes available")
+        logger.error(f'Inference request {inference_request.id} failed: No active worker nodes available')
+        return
+    
+    # For simplicity, use the first active node
+    # In a real system, you would select based on load, capabilities, etc.
+    node = active_nodes.first()
+    
+    try:
+        logger.info(f'Loading model {inference_request.model_name} on node {node.hostname} for request {inference_request.id}')
+        
+        # First, try to load the model if not already loaded
+        load_response = requests.post(
+            f"{node.get_url()}/load_model",
+            json={'model_name': inference_request.model_name},
+            timeout=300,  # Loading can take time
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        if load_response.status_code != 200:
+            error_message = f"Failed to load model: {load_response.text}"
+            inference_request.mark_failed(error_message)
+            logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+            return
+        
+        logger.info(f'Model {inference_request.model_name} loaded successfully on node {node.hostname}')
+        
+        # Now run inference
+        response = requests.post(
+            f"{node.get_url()}/inference",
+            json={
+                'model_name': inference_request.model_name,
+                'prompt': inference_request.prompt,
+                'max_length': 100,  # Default value, could be configurable
+                'timeout': 60  # Add timeout parameter
+            },
+            timeout=120,  # Extended timeout for the HTTP request itself
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        process_inference_response(inference_request, response)
+    
+    except requests.RequestException as e:
+        error_message = f"Connection error: {str(e)}"
+        inference_request.mark_failed(error_message)
+        logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+    except Exception as e:
+        error_message = str(e)
+        inference_request.mark_failed(error_message)
+        logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+
+def process_inference_response(inference_request, response):
+    """Process response from worker node after inference."""
+    try:
+        if response.status_code == 200:
+            result_data = response.json()
+            if result_data.get('status') == 'success':
+                inference_request.mark_completed(result_data.get('result', ''))
+                logger.info(f'Inference request {inference_request.id} completed successfully')
+            else:
+                error_message = result_data.get('message', 'Unknown error')
+                inference_request.mark_failed(error_message)
+                logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+        else:
+            error_message = f"Node returned status code {response.status_code}: {response.text}"
+            inference_request.mark_failed(error_message)
+            logger.error(error_message)
+    except ValueError as e:
+        error_message = f"Invalid JSON response: {str(e)}"
+        inference_request.mark_failed(error_message)
+        logger.error(f'Inference request {inference_request.id} failed: {error_message}')
+    except Exception as e:
+        error_message = f"Error processing response: {str(e)}"
+        inference_request.mark_failed(error_message)
+        logger.error(f'Inference request {inference_request.id} failed: {error_message}')

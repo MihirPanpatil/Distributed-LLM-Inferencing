@@ -123,7 +123,7 @@
                     $("#inferences-table-body").empty();
                     
                     if (data.requests.length === 0) {
-                        $("#inferences-table-body").html('<tr><td colspan="6" class="text-center">No inference requests yet</td></tr>');
+                        $("#inferences-table-body").append('<tr><td colspan="6" class="text-center">No inference requests yet</td></tr>');
                         return;
                     }
                     
@@ -315,4 +315,3 @@
     });
 </script>
 {% endblock %}
-

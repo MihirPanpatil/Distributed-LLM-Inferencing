@@ -1,18 +1,21 @@
 import os
 import json
 import time
+import logging
 from functools import wraps
 
 import torch
 import psutil
-import paramiko
-import requests
-from flask import Flask, request, jsonify
+from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from django.conf import settings
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-app = Flask(__name__)
+# Configure logging
+logger = logging.getLogger(__name__)
 
-# Configuration
+# Configuration from environment variables
 MODEL_CACHE_DIR = os.environ.get('MODEL_CACHE_DIR', '/app/model_cache')
 USE_GPU = os.environ.get('USE_GPU', '0') == '1'
 AUTH_ENABLED = os.environ.get('AUTH_ENABLED', '0') == '1'
@@ -29,26 +32,25 @@ loaded_models = {}
 loaded_tokenizers = {}
 loaded_shards = {}
 
-def require_auth(f):
+def require_auth(view_func):
     """Decorator to require authentication for endpoints."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
+    @wraps(view_func)
+    def decorated(request, *args, **kwargs):
         if not AUTH_ENABLED:
-            return f(*args, **kwargs)
+            return view_func(request, *args, **kwargs)
         
         auth_header = request.headers.get('Authorization')
         if not auth_header or auth_header != f'Bearer {AUTH_KEY}':
-            return jsonify({
+            return JsonResponse({
                 'status': 'error',
                 'message': 'Unauthorized access'
-            }), 401
+            }, status=401)
         
-        return f(*args, **kwargs)
+        return view_func(request, *args, **kwargs)
     return decorated
 
-@app.route('/health', methods=['GET'])
 @require_auth
-def health_check():
+def health_check(request):
     """Endpoint to check worker health and resource usage."""
     # Get system resource usage
     cpu_percent = psutil.cpu_percent() / 100.0
@@ -75,7 +77,7 @@ def health_check():
                 'metadata': shard_data['metadata']
             })
     
-    return jsonify({
+    return JsonResponse({
         'status': 'healthy',
         'resources': {
             'cpu': cpu_percent,
@@ -89,23 +91,24 @@ def health_check():
         'loaded_shards': shard_info
     })
 
-@app.route('/load_model', methods=['POST'])
+@csrf_exempt
+@require_POST
 @require_auth
-def load_model():
+def load_model(request):
     """Endpoint to load a complete model."""
-    data = request.json
-    model_name = data.get('model_name')
-    
-    if not model_name:
-        return jsonify({
-            'status': 'error',
-            'message': 'Model name is required'
-        }), 400
-    
     try:
+        data = json.loads(request.body)
+        model_name = data.get('model_name')
+        
+        if not model_name:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Model name is required'
+            }, status=400)
+        
         # Check if model is already loaded
         if model_name in loaded_models:
-            return jsonify({
+            return JsonResponse({
                 'status': 'success',
                 'message': f'Model {model_name} is already loaded'
             })
@@ -123,40 +126,42 @@ def load_model():
         
         loaded_models[model_name] = model
         
-        return jsonify({
+        return JsonResponse({
             'status': 'success',
             'message': f'Model {model_name} loaded successfully on {DEVICE}'
         })
     
     except Exception as e:
-        return jsonify({
+        logger.error(f'Failed to load model: {str(e)}', exc_info=True)
+        return JsonResponse({
             'status': 'error',
             'message': f'Failed to load model: {str(e)}'
-        }), 500
+        }, status=500)
 
-@app.route('/load_shard', methods=['POST'])
+@csrf_exempt
+@require_POST
 @require_auth
-def load_shard():
+def load_shard(request):
     """Endpoint to load a model shard."""
-    data = request.json
-    model_name = data.get('model_name')
-    shard_id = data.get('shard_id')
-    shard_path = data.get('shard_path')
-    
-    if not all([model_name, shard_id, shard_path]):
-        return jsonify({
-            'status': 'error',
-            'message': 'Model name, shard ID, and shard path are required'
-        }), 400
-    
     try:
+        data = json.loads(request.body)
+        model_name = data.get('model_name')
+        shard_id = data.get('shard_id')
+        shard_path = data.get('shard_path')
+        
+        if not all([model_name, shard_id, shard_path]):
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Model name, shard ID, and shard path are required'
+            }, status=400)
+        
         # Initialize the model_name entry in loaded_shards if it doesn't exist
         if model_name not in loaded_shards:
             loaded_shards[model_name] = {}
         
         # Check if shard is already loaded
         if shard_id in loaded_shards[model_name]:
-            return jsonify({
+            return JsonResponse({
                 'status': 'success',
                 'message': f'Shard {shard_id} of model {model_name} is already loaded'
             })
@@ -191,31 +196,33 @@ def load_shard():
             'metadata': metadata
         }
         
-        return jsonify({
+        return JsonResponse({
             'status': 'success',
             'message': f'Shard {shard_id} of model {model_name} loaded successfully'
         })
     
     except Exception as e:
-        return jsonify({
+        logger.error(f'Failed to load shard: {str(e)}', exc_info=True)
+        return JsonResponse({
             'status': 'error',
             'message': f'Failed to load shard: {str(e)}'
-        }), 500
+        }, status=500)
 
-@app.route('/unload_model', methods=['POST'])
+@csrf_exempt
+@require_POST
 @require_auth
-def unload_model():
+def unload_model(request):
     """Endpoint to unload a model."""
-    data = request.json
-    model_name = data.get('model_name')
-    
-    if not model_name:
-        return jsonify({
-            'status': 'error',
-            'message': 'Model name is required'
-        }), 400
-    
     try:
+        data = json.loads(request.body)
+        model_name = data.get('model_name')
+        
+        if not model_name:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Model name is required'
+            }, status=400)
+        
         # Unload the model
         if model_name in loaded_models:
             # Delete the model to free up memory
@@ -235,35 +242,37 @@ def unload_model():
         if DEVICE == 'cuda':
             torch.cuda.empty_cache()
         
-        return jsonify({
+        return JsonResponse({
             'status': 'success',
             'message': f'Model {model_name} unloaded successfully'
         })
     
     except Exception as e:
-        return jsonify({
+        logger.error(f'Failed to unload model: {str(e)}', exc_info=True)
+        return JsonResponse({
             'status': 'error',
             'message': f'Failed to unload model: {str(e)}'
-        }), 500
+        }, status=500)
 
-@app.route('/inference', methods=['POST'])
+@csrf_exempt
+@require_POST
 @require_auth
-def run_inference():
+def run_inference(request):
     """Endpoint to run inference with a model."""
-    data = request.json
-    model_name = data.get('model_name')
-    prompt = data.get('prompt')
-    max_length = data.get('max_length', 100)
-    shard_ids = data.get('shard_ids')
-    timeout = data.get('timeout', 60)
-    
-    if not all([model_name, prompt]):
-        return jsonify({
-            'status': 'error',
-            'message': 'Model name and prompt are required'
-        }), 400
-    
     try:
+        data = json.loads(request.body)
+        model_name = data.get('model_name')
+        prompt = data.get('prompt')
+        max_length = data.get('max_length', 100)
+        shard_ids = data.get('shard_ids')
+        timeout = data.get('timeout', 60)
+        
+        if not all([model_name, prompt]):
+            return JsonResponse({
+                'status': 'error',
+                'message': 'Model name and prompt are required'
+            }, status=400)
+        
         # Set a timer to track execution time
         start_time = time.time()
         
@@ -273,10 +282,27 @@ def run_inference():
         else:
             # Load the model if not already loaded
             if model_name not in loaded_models:
-                # Try to load the model
-                load_response = load_model()
-                if isinstance(load_response, tuple) and load_response[1] == 500:
-                    return load_response
+                try:
+                    # Check if model is already loaded
+                    if model_name not in loaded_models:
+                        # Load tokenizer
+                        if model_name not in loaded_tokenizers:
+                            tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
+                            loaded_tokenizers[model_name] = tokenizer
+                        
+                        # Load model
+                        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
+                        
+                        # Move model to appropriate device
+                        model = model.to(DEVICE)
+                        
+                        loaded_models[model_name] = model
+                except Exception as e:
+                    logger.error(f'Failed to load model internally: {str(e)}', exc_info=True)
+                    return JsonResponse({
+                        'status': 'error',
+                        'message': f'Failed to load model: {str(e)}'
+                    }, status=500)
             
             # Get the model and tokenizer
             model = loaded_models[model_name]
@@ -288,7 +314,10 @@ def run_inference():
             
             # Check timeout
             if (time.time() - start_time) > timeout:
-                raise TimeoutError("Inference preparation timed out")
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Inference preparation timed out'
+                }, status=408)
             
             # Generate text
             outputs = model.generate(
@@ -306,25 +335,23 @@ def run_inference():
             
             # Check timeout again
             if (time.time() - start_time) > timeout:
-                raise TimeoutError("Inference generation timed out")
+                return JsonResponse({
+                    'status': 'error',
+                    'message': 'Inference generation timed out'
+                }, status=408)
         
-        return jsonify({
+        return JsonResponse({
             'status': 'success',
             'result': result,
             'execution_time': time.time() - start_time
         })
     
-    except TimeoutError as e:
-        return jsonify({
-            'status': 'error',
-            'message': str(e)
-        }), 408  # Request Timeout
-    
     except Exception as e:
-        return jsonify({
+        logger.error(f'Inference failed: {str(e)}', exc_info=True)
+        return JsonResponse({
             'status': 'error',
             'message': f'Inference failed: {str(e)}'
-        }), 500
+        }, status=500)
 
 def run_shard_inference(model_name, prompt, shard_ids, max_length):
     """Run inference using model shards."""
@@ -366,47 +393,3 @@ def run_shard_inference(model_name, prompt, shard_ids, max_length):
     result = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     return result
-
-@app.route('/ssh_setup', methods=['POST'])
-@require_auth
-def setup_ssh_connection():
-    """Endpoint to set up an SSH tunnel for secure communication."""
-    data = request.json
-    host = data.get('host')
-    port = data.get('port', 22)
-    username = data.get('username')
-    password = data.get('password')
-    key_path = data.get('key_path')
-    
-    if not host or not (password or key_path) or not username:
-        return jsonify({
-            'status': 'error',
-            'message': 'Host, username, and either password or key_path are required'
-        }), 400
-    
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
-        if key_path:
-            key = paramiko.RSAKey.from_private_key_file(key_path)
-            client.connect(hostname=host, port=port, username=username, pkey=key)
-        else:
-            client.connect(hostname=host, port=port, username=username, password=password)
-        
-        # Close connection after successful test
-        client.close()
-        
-        return jsonify({
-            'status': 'success',
-            'message': f'SSH connection to {host} established successfully'
-        })
-    
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'SSH connection failed: {str(e)}'
-        }), 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)

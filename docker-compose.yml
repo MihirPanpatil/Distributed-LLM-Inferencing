@@ -14,6 +14,7 @@ services:
       - model_cache:/app/model_cache
     environment:
       - DEBUG=1
+      - DJANGO_SETTINGS_MODULE=master.settings
       - SECRET_KEY=your-secret-key-change-in-production
       - REDIS_HOST=redis
       - REDIS_PORT=6379
@@ -30,13 +31,19 @@ services:
       dockerfile: Dockerfile
       args:
         - USE_GPU=0
+    ports:
+      - "5001:8000"
     volumes:
       - ./worker:/app
       - model_cache:/app/model_cache
     environment:
+      - DEBUG=1
+      - DJANGO_SETTINGS_MODULE=worker.settings
+      - SECRET_KEY=worker-secret-key-change-in-production
       - MODEL_CACHE_DIR=/app/model_cache
       - USE_GPU=0
       - AUTH_ENABLED=0
+      - AUTH_KEY=default-auth-key-change-in-production
     restart: unless-stopped
 
   worker2:
@@ -45,13 +52,19 @@ services:
       dockerfile: Dockerfile
       args:
         - USE_GPU=0
+    ports:
+      - "5002:8000"
     volumes:
       - ./worker:/app
       - model_cache:/app/model_cache
     environment:
+      - DEBUG=1
+      - DJANGO_SETTINGS_MODULE=worker.settings
+      - SECRET_KEY=worker-secret-key-change-in-production
       - MODEL_CACHE_DIR=/app/model_cache
       - USE_GPU=0
       - AUTH_ENABLED=0
+      - AUTH_KEY=default-auth-key-change-in-production
     restart: unless-stopped
 
   redis:
