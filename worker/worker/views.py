@@ -2,7 +2,6 @@ import os
 import json
 import time
 import logging
-import functools
 from functools import wraps
 
 import torch
@@ -283,10 +282,27 @@ def run_inference(request):
         else:
             # Load the model if not already loaded
             if model_name not in loaded_models:
-                # Try to load the model
-                model_response = load_model_internal(model_name)
-                if model_response.get('status') == 'error':
-                    return JsonResponse(model_response, status=500)
+                try:
+                    # Check if model is already loaded
+                    if model_name not in loaded_models:
+                        # Load tokenizer
+                        if model_name not in loaded_tokenizers:
+                            tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
+                            loaded_tokenizers[model_name] = tokenizer
+                        
+                        # Load model
+                        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
+                        
+                        # Move model to appropriate device
+                        model = model.to(DEVICE)
+                        
+                        loaded_models[model_name] = model
+                except Exception as e:
+                    logger.error(f'Failed to load model internally: {str(e)}', exc_info=True)
+                    return JsonResponse({
+                        'status': 'error',
+                        'message': f'Failed to load model: {str(e)}'
+                    }, status=500)
             
             # Get the model and tokenizer
             model = loaded_models[model_name]
@@ -377,38 +393,3 @@ def run_shard_inference(model_name, prompt, shard_ids, max_length):
     result = tokenizer.decode(outputs[0], skip_special_tokens=True)
     
     return result
-
-def load_model_internal(model_name):
-    """Internal helper function to load a model."""
-    try:
-        # Check if model is already loaded
-        if model_name in loaded_models:
-            return {
-                'status': 'success',
-                'message': f'Model {model_name} is already loaded'
-            }
-        
-        # Load tokenizer
-        if model_name not in loaded_tokenizers:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
-            loaded_tokenizers[model_name] = tokenizer
-        
-        # Load model
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
-        
-        # Move model to appropriate device
-        model = model.to(DEVICE)
-        
-        loaded_models[model_name] = model
-        
-        return {
-            'status': 'success',
-            'message': f'Model {model_name} loaded successfully on {DEVICE}'
-        }
-    
-    except Exception as e:
-        logger.error(f'Failed to load model internally: {str(e)}', exc_info=True)
-        return {
-            'status': 'error',
-            'message': f'Failed to load model: {str(e)}'
-        }
